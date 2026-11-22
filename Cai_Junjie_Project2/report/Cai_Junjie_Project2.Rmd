@@ -1,0 +1,282 @@
+---
+title: "Air Pollution at the RDU Airport Monitor, 2018–2020"
+subtitle: "Project 2: Data Processing and Exploratory Data Analysis"
+author: "Junjie Cai"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document:
+    reference_docx: reference.docx
+    fig_caption: true
+---
+
+```{r setup, include = FALSE}
+# -----------------------------------------------------------------------------
+# Global chunk options: hide all code, messages, and warnings in the Word file
+# -----------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 300)
+
+# -----------------------------------------------------------------------------
+# Packages
+# -----------------------------------------------------------------------------
+library(readr)      # read_csv(), write_csv()
+library(dplyr)      # data manipulation
+library(tidyr)      # pivot_longer(), pivot_wider()
+library(purrr)      # map() to apply the function to each file
+library(lubridate)  # mdy(), year(), month()
+library(ggplot2)    # plots
+library(flextable)  # Word-ready tables
+library(here)       # project-relative file paths
+
+# -----------------------------------------------------------------------------
+# Custom functions (kept in separate scripts in the R/ folder)
+# -----------------------------------------------------------------------------
+source(here("R", "process_aq.R"))        # cleans one year of raw data
+source(here("R", "make_minmax_table.R")) # table styling + yearly min/max table
+
+# Use Times New Roman (serif) text in all plots to match the report font
+update_geom_defaults("text", list(family = "serif"))
+
+# Colorblind-safe (Okabe-Ito) colors used throughout the report
+pollutant_colors <- c("CO" = "#D55E00", "O3" = "#0072B2")
+year_colors      <- c("2018" = "#E69F00", "2019" = "#56B4E9", "2020" = "#009E73")
+
+# Readable pollutant labels (with units) used in the tables
+pollutant_labels <- c(co_ppm    = "Carbon monoxide, CO (ppm)",
+                      pm25_ugm3 = "Fine particulate matter, PM₂.₅ (µg/m³)",
+                      o3_ppm    = "Ozone, O₃ (ppm)")
+
+# Shared ggplot theme so both figures look consistent
+theme_report <- function() {
+  theme_minimal(base_size = 11, base_family = "serif") +
+    theme(legend.position  = "bottom",
+          plot.title       = element_text(face = "bold", size = 13),
+          plot.subtitle    = element_text(color = "grey30"),
+          strip.text       = element_text(face = "bold", size = 11),
+          panel.grid.minor = element_blank())
+}
+```
+
+```{r process-data}
+# -----------------------------------------------------------------------------
+# Run the processing function on each year's file and combine the results
+# -----------------------------------------------------------------------------
+data_files <- here("data", paste0("AQ_", 2018:2020, ".csv"))
+
+# Main analysis dataset: O3 in ppm (the function's default units)
+aq <- data_files |>
+  map(process_aq) |>
+  bind_rows() |>
+  mutate(year  = year(date),
+         # abbreviated month names as an ordered factor (Jan ... Dec)
+         month = factor(month.abb[month(date)], levels = month.abb))
+
+# Same data with O3 in ppb (used for Figure 1 so that O3 values are easy to read)
+aq_ppb <- data_files |>
+  map(\(f) process_aq(f, o3_units = "ppb")) |>
+  bind_rows() |>
+  mutate(year  = year(date),
+         month = factor(month.abb[month(date)], levels = month.abb))
+
+# Quick integrity checks: exactly one row per day, no negative concentrations
+stopifnot(!any(duplicated(aq$date)),
+          all(c(aq$co_ppm, aq$pm25_ugm3, aq$o3_ppm) >= 0, na.rm = TRUE))
+
+# Save the combined, cleaned dataset for reuse
+dir.create(here("data", "processed"), showWarnings = FALSE)
+write_csv(aq |> select(-month), here("data", "processed", "aq_clean_2018_2020.csv"))
+
+# Number of days per year (used in the text below)
+days_per_year <- count(aq, year)
+n_days <- function(yr) days_per_year$n[days_per_year$year == yr]
+```
+
+```{r data-quality}
+# -----------------------------------------------------------------------------
+# Data-quality summary: what the cleaning steps changed in each raw file
+# (computed directly from the raw files, independently of process_aq())
+# -----------------------------------------------------------------------------
+quality_tbl <- map(2018:2020, function(yr) {
+  raw <- read_csv(here("data", paste0("AQ_", yr, ".csv")), show_col_types = FALSE)
+  names(raw)[c(2, 4, 6)] <- c("co", "pm25", "o3")   # short names for this summary
+  dedup <- distinct(raw)
+  tibble(
+    Year                          = as.character(yr),
+    `Raw rows`                    = nrow(raw),
+    `Duplicate rows removed`      = nrow(raw) - nrow(dedup),
+    `Negative values set to 0`    = sum(dedup$co < 0, dedup$pm25 < 0, dedup$o3 < 0, na.rm = TRUE),
+    `Days with repeated readings` = sum(count(dedup, Date)$n > 1),
+    `Days in clean data`          = n_distinct(dedup$Date)
+  )
+}) |>
+  bind_rows()
+```
+
+**Code and data availability:** All code, data, and the R Markdown source used to produce this report are available on GitHub at <https://github.com/CX-JIE/721-R> (folder `Cai_Junjie_Project2`).
+
+# Introduction
+
+Sickle cell disease (SCD) is a group of inherited red blood cell disorders in which red blood cells contort into a sickle shape, causing anemia, pain, infection, and stroke. There is some evidence that exposure to air pollution aggravates vaso-occlusion and pain in people with SCD. To support a study by a Duke hematologist of the associations between air pollutants and SCD health system utilization (emergency department visits, hospitalizations, etc.) in Durham County, North Carolina, this report prepares the exposure data: it processes raw daily measurements of carbon monoxide (CO), fine particulate matter (PM~2.5~), and ozone (O~3~) from the EPA air quality monitor at Raleigh-Durham International (RDU) Airport and explores them with tables and plots.
+
+# Data
+
+The data are raw daily measurements from the EPA monitor at RDU Airport, provided as one file per year for 2018, 2019, and 2020; the 2020 file covers January through April only. Table 1 describes the variables in the cleaned dataset.
+
+```{r table-dictionary}
+tibble(
+  Variable    = c("date", "co_ppm", "pm25_ugm3", "o3_ppm / o3_ppb"),
+  Description = c("Calendar date of the measurement",
+                  "Daily maximum 8-hour carbon monoxide concentration",
+                  "Daily mean fine particulate matter (PM₂.₅) concentration",
+                  "Daily maximum 8-hour ozone concentration"),
+  Units       = c("—", "ppm", "µg/m³", "ppm (default) or ppb")
+) |>
+  flextable() |>
+  style_report_table(caption = "Table 1. Variables in the cleaned air quality dataset",
+                     first_col_width = 1.5) |>
+  bold(j = "Variable", part = "body") |>
+  font(j = "Variable", fontname = "Courier New", part = "body")
+```
+
+# Data Processing
+
+Each year of raw data was cleaned with a single custom R function, `process_aq()`, and the three cleaned years were then combined into one dataset. For each file the function (1) removes exact duplicate rows, (2) sets any negative concentration (a measurement error) to zero, (3) averages repeated measurements taken on the same day so that there is exactly one row per day, and (4) optionally converts O~3~ from ppm to ppb (1 ppm = 1,000 ppb). Along the way it renames the pollutant columns and converts the dates, which were recorded in two different formats (e.g., `01/01/2018` and `1/1/2020`), to a true date variable.
+
+**Why the order matters.** Duplicates are removed *before* averaging so that a duplicated record is not counted twice in a daily average, and negative values are set to zero *before* averaging so that an impossible reading cannot pull a daily average down (or hide inside an average that happens to be positive). Converting units last has no effect on the results because it is a simple rescaling.
+
+Table 2 summarizes what these steps changed in each file. The final dataset contains `r n_days(2018)` days in 2018, `r n_days(2019)` days in 2019, and `r n_days(2020)` days in 2020.
+
+```{r table-quality}
+quality_tbl |>
+  flextable() |>
+  style_report_table(caption = "Table 2. Data-quality issues found and corrected in each raw file",
+                     first_col_width = 0.6) |>
+  align(j = 2:6, align = "center", part = "all")
+```
+
+# Minimum and Maximum Daily Concentrations
+
+Tables 3–5 show the lowest and highest daily concentration of each pollutant in each year, along with the number of days on which the pollutant was measured.
+
+```{r table-2018}
+make_minmax_table(aq, yr = 2018, table_num = 3)
+```
+
+```{r table-2019}
+make_minmax_table(aq, yr = 2019, table_num = 4)
+```
+
+```{r table-2020}
+make_minmax_table(aq, yr = 2020, table_num = 5)
+```
+
+*Note: 2020 data are available for January–April only, so the 2020 minimum and maximum values are not directly comparable to the full years 2018 and 2019.*
+
+# Annual Averages
+
+To put the extremes in context, Table 6 gives the mean and standard deviation of the daily concentrations in each year.
+
+```{r table-annual}
+aq |>
+  pivot_longer(c(co_ppm, pm25_ugm3, o3_ppm), names_to = "pollutant", values_to = "conc") |>
+  group_by(pollutant, year) |>
+  summarise(value = sprintf("%.3f (%.3f)", mean(conc, na.rm = TRUE), sd(conc, na.rm = TRUE)),
+            .groups = "drop") |>
+  pivot_wider(names_from = year, values_from = value) |>
+  mutate(pollutant = factor(pollutant, levels = names(pollutant_labels))) |>
+  arrange(pollutant) |>
+  mutate(Pollutant = unname(pollutant_labels[as.character(pollutant)])) |>
+  select(Pollutant, `2018`, `2019`, `2020`) |>
+  flextable() |>
+  set_header_labels(`2020` = "2020 (Jan–Apr)") |>
+  style_report_table(caption = "Table 6. Mean (standard deviation) of daily pollutant concentrations by year") |>
+  align(j = 2:4, align = "center", part = "all")
+```
+
+# Monthly Patterns in CO and Ozone
+
+```{r plot1-data}
+# -----------------------------------------------------------------------------
+# Monthly mean and 95% CI for CO and O3, pooling all daily values for each
+# calendar month across years:  mean +/- 1.96 * sd / sqrt(n)
+# where n = number of days with a non-missing measurement in that month.
+# -----------------------------------------------------------------------------
+panel_levels <- c("bold(Carbon~monoxide*','~CO~(ppm))", "bold(Ozone*','~O[3]~(ppb))")
+
+monthly_co_o3 <- aq_ppb |>
+  select(month, CO = co_ppm, O3 = o3_ppb) |>
+  pivot_longer(c(CO, O3), names_to = "pollutant", values_to = "conc") |>
+  filter(!is.na(conc)) |>
+  group_by(pollutant, month) |>
+  summarise(mean = mean(conc),
+            sd   = sd(conc),
+            n    = n(),
+            .groups = "drop") |>
+  mutate(se        = sd / sqrt(n),
+         lower     = mean - 1.96 * se,
+         upper     = mean + 1.96 * se,
+         month_num = as.integer(month),   # numeric month (1-12) for plotting
+         # facet labels (plotmath, so the subscript in O3 renders) with units
+         panel = factor(if_else(pollutant == "CO", panel_levels[1], panel_levels[2]),
+                        levels = panel_levels))
+
+# Label for the shaded May-Dec band (shown in the top panel only)
+band_label <- tibble(panel = factor(panel_levels[1], levels = panel_levels),
+                     x = 8.5, label = "May–Dec: 2018–2019 data only")
+```
+
+```{r plot1, fig.width = 6.5, fig.height = 3.7, fig.cap = "Figure 1. Monthly mean daily concentrations of CO (daily max 8-hour, ppm) and O₃ (daily max 8-hour, ppb) with 95% confidence intervals, RDU airport monitor. January–April pool 2018–2020; May–December (shaded) pool 2018–2019."}
+ggplot(monthly_co_o3, aes(x = month_num, y = mean, color = pollutant, group = pollutant)) +
+  # shade the months that are based on only two years of data
+  annotate("rect", xmin = 4.5, xmax = 12.5, ymin = -Inf, ymax = Inf,
+           fill = "grey90", alpha = 0.6) +
+  geom_text(data = band_label, aes(x = x, y = Inf, label = label),
+            inherit.aes = FALSE, vjust = 1.5, size = 3.2, color = "grey35", family = "serif") +
+  geom_line(linewidth = 0.5, alpha = 0.4) +           # faint line to guide the eye
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.3, linewidth = 0.6) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ panel, ncol = 1, scales = "free_y",    # separate y-axis per pollutant
+             labeller = label_parsed) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb, expand = expansion(add = 0.4)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+  scale_color_manual(values = pollutant_colors, name = "Pollutant",
+                     breaks = c("CO", "O3"), labels = expression(CO, O[3])) +
+  labs(title = "CO peaks in winter while ozone peaks in late spring and summer",
+       subtitle = "Monthly mean of daily concentrations ± 95% CI, pooled across years",
+       x = "Month",
+       y = "Mean daily concentration") +
+  theme_report() +
+  theme(panel.grid.major.x = element_blank())
+```
+
+Because CO (about 0.25–0.5 ppm) and O~3~ (about 0.03–0.05 ppm) are measured on very different scales, I plotted them in separate stacked panels with their own y-axes (sharing the same month axis), and I expressed O~3~ in ppb using the function's units argument so that its values are easy to read. This keeps both seasonal patterns visible without distorting either pollutant's units, as rescaling or a secondary axis would.
+
+# Monthly Patterns in PM~2.5~ by Year
+
+```{r plot2, fig.width = 6.5, fig.height = 3.5, fig.cap = "Figure 2. Distribution of daily mean PM₂.₅ concentrations by month and year, RDU airport monitor. Boxes show the median and interquartile range; whiskers extend to 1.5 × IQR; points are individual outlying days. 2020 data end in April."}
+aq |>
+  filter(!is.na(pm25_ugm3)) |>
+  mutate(year = factor(year)) |>
+  ggplot(aes(x = month, y = pm25_ugm3, fill = year)) +
+  geom_boxplot(position = position_dodge2(preserve = "single", padding = 0.15),
+               outlier.size = 0.8, outlier.alpha = 0.6,
+               linewidth = 0.35, width = 0.8) +
+  scale_fill_manual(values = year_colors, name = "Year") +
+  scale_x_discrete(drop = FALSE) +
+  labs(title = expression(bold("Daily PM"[2.5]*" concentrations by month and year")),
+       subtitle = "No strong seasonal cycle; 2018 is higher than 2019 in most months from June to December",
+       x = "Month",
+       y = expression("Daily mean PM"[2.5]*" ("*mu*"g/m"^3*")")) +
+  theme_report() +
+  theme(panel.grid.major.x = element_blank())
+```
+
+I used side-by-side boxplots because, with roughly 30 overlapping daily values per month and year, they summarize each month's center and spread (and flag unusual days) far more readably than individual points, while still letting the three years be compared month by month.
+
+# Interpretation
+
+CO and O~3~ show clear and opposite seasonal patterns: CO is highest in the late fall and winter (monthly mean about 0.51 ppm in December) and lowest from May to July (about 0.25 ppm), whereas O~3~ peaks in late spring and summer (about 50 ppb in June) and is lowest in November–January (about 28 ppb in December). PM~2.5~ shows no consistent seasonal cycle, but 2018 was higher than 2019 in most months from June through December (September is the exception), and early 2020 had low typical (median) levels in January–February even though it contained the single highest daily PM~2.5~ value in the data (31.2 µg/m³ on February 13, 2020; Table 5). These comparisons should be read with caution because May–December estimates rest on only two years of data and 2020 contributes only four months.
+
+# AI Use Statement
+
+I used Claude (an AI assistant from Anthropic) to help draft the R code, the report text, and the README. I checked its output by reviewing every step of the code, confirming that the processed data matched the raw files (duplicates removed, the negative PM~2.5~ value set to zero, one row per day), and comparing the table and plot values against an independent recalculation.
